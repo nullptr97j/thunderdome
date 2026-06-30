@@ -226,6 +226,70 @@ impl<T> Arena<T> {
         }
     }
 
+    /// Inserts a value into the arena that depends on its own assigned [`Index`].
+    ///
+    /// This method looks up or allocates the next vacant slot, constructs the true
+    /// generational `Index`, and then passes that index into the provided closure `f`.
+    /// The value returned by the closure is then immediately stored in that slot.
+    ///
+    /// This prevents split-phase initialization bugs and allows assets to store copies
+    /// of their own handles or identifiers safely inside their data structures.
+    pub fn insert_with<F>(&mut self, f: F) -> Index 
+    where
+        F: FnOnce(Index) -> T,
+    {
+        // 1. This value will definitely be inserted, update length.
+        self.len = self
+            .len
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("Cannot insert more than u32::MAX elements into Arena"));
+
+        // 2. Separate logic depending on whether we are recycling an empty slot or extending
+        if let Some(free_pointer) = self.first_free {
+            let slot = free_pointer.slot();
+            
+            // We temporarily extract the slot's tracking block to avoid double-borrowing self.storage
+            let entry = self.storage.get_mut(slot as usize).unwrap_or_else(|| {
+                unreachable!("first_free pointed past the end of the arena's storage")
+            });
+
+            let empty = entry
+                .as_empty()
+                .unwrap_or_else(|| unreachable!("first_free pointed to an occupied entry"));
+
+            self.first_free = empty.next_free;
+            let generation = empty.generation.next();
+            
+            // Construct the real index
+            let index = Index { slot, generation };
+            
+            // Pass it to the closure to manufacture the value T
+            let value = f(index);
+
+            // Write the occupied block into the storage array
+            *entry = Entry::Occupied(OccupiedEntry { generation, value });
+
+            index
+        } else {
+            // No free blocks left, calculate the trailing index parameters
+            let generation = Generation::first();
+            let slot: u32 = self.storage.len().try_into().unwrap_or_else(|_| {
+                unreachable!("Arena storage exceeded what can be represented by a u32")
+            });
+
+            let index = Index { slot, generation };
+            
+            // Generate the value
+            let value = f(index);
+
+            // Append it to the dense array
+            self.storage
+                .push(Entry::Occupied(OccupiedEntry { generation, value }));
+
+            index
+        }
+    }
+
     /// Traverse the free list and remove this known-empty slot from it, given the slot to remove
     /// and the `next_free` pointer of that slot.
     fn remove_slot_from_free_list(&mut self, slot: u32, new_next_free: Option<FreePointer>) {
